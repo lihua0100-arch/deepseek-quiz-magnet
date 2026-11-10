@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DeepSeek 智能题库解析与磁吸自瞄助手 Pro (3.1 U校园/选词填空精准定位版)
 // @namespace    https://tampermonkey.net/
-// @version      3.2.1
+// @version      3.2.2
 // @updateURL    https://raw.githubusercontent.com/lihua0100-arch/deepseek-quiz-magnet/main/deepseek-quiz-magnet.user.js
 // @downloadURL  https://raw.githubusercontent.com/lihua0100-arch/deepseek-quiz-magnet/main/deepseek-quiz-magnet.user.js
 // @description  修复U校园等平台多空选词填空“指第5空却识别到第6空/漏识别空格位置”的问题：精准将<input>原位转写为[[👉当前目标空格👈]]标记、自动抓取滚动区上方词库框(words in the box)、支持单行题块与已填词排除法。
@@ -1190,6 +1190,7 @@
      * 10. 点击事件拦截
      ********************************************************************/
     window.addEventListener('click', (e) => {
+        if (e.target instanceof Element && e.target.closest('[data-ds-touch-panel]')) return;
         if (STATE.pickerMode) {
             e.stopPropagation();
             e.preventDefault();
