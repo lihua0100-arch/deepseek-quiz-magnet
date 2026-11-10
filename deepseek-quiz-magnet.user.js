@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DeepSeek 智能题库解析与磁吸自瞄助手 Pro (3.1 U校园/选词填空精准定位版)
 // @namespace    https://tampermonkey.net/
-// @version      3.1.1
+// @version      3.2.0
 // @updateURL    https://raw.githubusercontent.com/lihua0100-arch/deepseek-quiz-magnet/main/deepseek-quiz-magnet.user.js
 // @downloadURL  https://raw.githubusercontent.com/lihua0100-arch/deepseek-quiz-magnet/main/deepseek-quiz-magnet.user.js
 // @description  修复U校园等平台多空选词填空“指第5空却识别到第6空/漏识别空格位置”的问题：精准将<input>原位转写为[[👉当前目标空格👈]]标记、自动抓取滚动区上方词库框(words in the box)、支持单行题块与已填词排除法。
@@ -1136,7 +1136,53 @@
         }
 
         cursorEl.style.transform = `translate3d(${STATE.virtualMouse.x - 3}px, ${STATE.virtualMouse.y - 2}px, 0)`;
-        requestAnimationFrame(updateMagnetPhysics);
+        // 触屏设备：先点“选题”，再点题目；不拦截普通滚动和点击。
+    if (window.matchMedia('(pointer: coarse)').matches || navigator.maxTouchPoints > 0) {
+        const panel = document.createElement('div');
+        panel.setAttribute('data-ds-touch-panel', '');
+        panel.style.cssText = 'position:fixed;z-index:2147483647;left:8px;bottom:12px;display:flex;gap:4px;flex-wrap:wrap;max-width:95vw;background:#172235ee;padding:6px;border-radius:10px;box-shadow:0 2px 10px #0006';
+        let armed = false;
+        function addTouchButton(label, action) {
+            const b = document.createElement('button');
+            b.type = 'button'; b.textContent = label;
+            b.style.cssText = 'font:14px sans-serif;color:white;background:#30557d;border:0;border-radius:6px;padding:9px 10px;touch-action:manipulation';
+            b.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); action(); });
+            panel.appendChild(b); return b;
+        }
+        const selectButton = addTouchButton('选题分析', () => {
+            armed = !armed;
+            selectButton.textContent = armed ? '取消选题' : '选题分析';
+            updateStatusBadge(armed ? '👆 请点击要分析的题目或空格' : '已取消选题');
+        });
+        addTouchButton('填写', fillTargetInputInstantly);
+        addTouchButton('记文章', captureReadingPassageToMemory);
+        addTouchButton('设置Key', () => {
+            const key = prompt('请输入您的 DeepSeek API Key：', STATE.apiKey);
+            if (key !== null) { STATE.apiKey = key.trim(); GM_setValue('DEEPSEEK_API_KEY', STATE.apiKey); updateStatusBadge(STATE.apiKey ? '✅ API Key 已保存' : '⚠️ 未配置 API Key'); }
+        });
+        addTouchButton('收起', () => {
+            const hidden = panel.dataset.collapsed === '1';
+            panel.dataset.collapsed = hidden ? '0' : '1';
+            Array.from(panel.children).forEach((el, i) => { if (i < panel.children.length - 1) el.style.display = hidden ? '' : 'none'; });
+            panel.lastElementChild.textContent = hidden ? '收起' : '展开';
+        });
+        document.body.appendChild(panel);
+        window.addEventListener('click', e => {
+            if (!armed || panel.contains(e.target)) return;
+            e.preventDefault(); e.stopImmediatePropagation();
+            armed = false; selectButton.textContent = '选题分析';
+            STATE.rawMouse.x = e.clientX; STATE.rawMouse.y = e.clientY;
+            const scope = findSmartScopeFromMousePoint(e.clientX, e.clientY) || e.target;
+            analyzeCurrentPageQuestion(scope);
+        }, true);
+        window.addEventListener('touchstart', e => {
+            if (panel.contains(e.target) || !e.touches.length) return;
+            STATE.rawMouse.x = e.touches[0].clientX; STATE.rawMouse.y = e.touches[0].clientY;
+            STATE.virtualMouse.x = STATE.rawMouse.x; STATE.virtualMouse.y = STATE.rawMouse.y;
+        }, {passive: true});
+    }
+
+    requestAnimationFrame(updateMagnetPhysics);
     }
     requestAnimationFrame(updateMagnetPhysics);
 
