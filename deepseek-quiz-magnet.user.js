@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DeepSeek 智能题库解析与磁吸自瞄助手 Pro (3.1 U校园/选词填空精准定位版)
 // @namespace    https://tampermonkey.net/
-// @version      3.2.2
+// @version      3.3.0
 // @updateURL    https://raw.githubusercontent.com/lihua0100-arch/deepseek-quiz-magnet/main/deepseek-quiz-magnet.user.js
 // @downloadURL  https://raw.githubusercontent.com/lihua0100-arch/deepseek-quiz-magnet/main/deepseek-quiz-magnet.user.js
 // @description  修复U校园等平台多空选词填空“指第5空却识别到第6空/漏识别空格位置”的问题：精准将<input>原位转写为[[👉当前目标空格👈]]标记、自动抓取滚动区上方词库框(words in the box)、支持单行题块与已填词排除法。
@@ -31,10 +31,7 @@
      ********************************************************************/
     const CONFIG = {
         apiUrl: 'https://api.deepseek.com/chat/completions',
-        magnetRadius: 340,        // 磁吸触发半径（像素）
-        lockRadius: 36,           // 强吸附锁定半径（像素）
-        pullStrength: 0.18,       // 每帧磁吸牵引系数 (0.05 ~ 0.35)
-        showVisualHint: true,     // 是否显示虚拟准星与状态栏
+        showVisualHint: true,     // 是否显示状态栏及提示
         enableStealthTyping: true // 填空/翻译/简答题是否开启“任意键伪装盲打”
     };
 
@@ -47,21 +44,18 @@
         asrInstance: null,
 
         enabled: true,
-        spacePressed: false,
         typingUnlocked: false,
         pickerMode: false,
         hoveredScopeEl: null,
         autoTypingTimer: null,
         isAnalyzing: false,
         rawMouse: { x: window.innerWidth / 2, y: window.innerHeight / 2 },
-        virtualMouse: { x: window.innerWidth / 2, y: window.innerHeight / 2 },
 
         questionType: 'choice',   // 'choice' | 'input' | 'translate' | 'essay'
         targetQueue: [],          // [{ el, text, altFormats: [], completed: false }]
         currentQueueIdx: 0,
         altFormatIdx: 0,
         typingCursorIndex: 0,
-        isRedirectingClick: false
     };
 
     /********************************************************************
@@ -104,7 +98,7 @@
         toggleModelMode();
     });
 
-    GM_registerMenuCommand(`👁️ 切换准星与状态栏显示 (${MOD_KEY_LABEL}+H)`, () => {
+    GM_registerMenuCommand(`👁️ 切换状态栏显示 (${MOD_KEY_LABEL}+H)`, () => {
         CONFIG.showVisualHint = !CONFIG.showVisualHint;
         toggleVisualUI(CONFIG.showVisualHint);
     });
@@ -127,27 +121,6 @@
             -webkit-user-select: text !important;
             -moz-user-select: text !important;
             user-select: text !important;
-        }
-        body.ds-magnet-active, body.ds-magnet-active * {
-            cursor: none !important;
-        }
-        #ds-virtual-cursor {
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 22px;
-            height: 22px;
-            pointer-events: none !important;
-            z-index: 2147483647;
-            transform: translate(-3px, -2px);
-            transition: filter 0.15s ease;
-            display: none;
-        }
-        #ds-virtual-cursor.ds-locked {
-            filter: drop-shadow(0 0 6px rgba(16, 185, 129, 0.95));
-        }
-        #ds-virtual-cursor.ds-unlocked-space {
-            filter: drop-shadow(0 0 6px rgba(245, 158, 11, 0.9));
         }
         #ds-status-badge {
             position: fixed;
@@ -193,22 +166,11 @@
 
     window.addEventListener('selectstart', (e) => e.stopPropagation(), true);
 
-    const cursorEl = document.createElement('div');
-    cursorEl.id = 'ds-virtual-cursor';
-    cursorEl.innerHTML = `
-        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path d="M4 2L20 11L12.5 13.5L16 21L13 22.2L9.5 14.8L4 19V2Z"
-                  fill="#ffffff" stroke="#0f172a" stroke-width="1.8" stroke-linejoin="round"/>
-            <circle id="ds-cursor-dot" cx="10" cy="10" r="2.2" fill="#10b981" opacity="0"/>
-        </svg>
-    `;
-    document.body.appendChild(cursorEl);
-
     const badgeEl = document.createElement('div');
     badgeEl.id = 'ds-status-badge';
     badgeEl.innerHTML = `
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:2px;gap:6px;">
-            <span style="font-weight:600;color:#38bdf8;">🎯 DeepSeek 磁吸/自瞄 3.1</span>
+            <span style="font-weight:600;color:#38bdf8;">🎯 DeepSeek 题库助手 3.3</span>
             <div style="display:flex;gap:4px;">
                 <span id="ds-mem-tag" style="font-size:10px;background:#065f46;padding:1px 5px;border-radius:4px;color:#a7f3d0;display:${STATE.savedPassage ? 'inline-block' : 'none'};">📚已存阅读(${STATE.savedPassage.length}字)</span>
                 <span id="ds-asr-tag" style="font-size:10px;background:#991b1b;padding:1px 5px;border-radius:4px;color:#fecaca;display:none;">🎙️听力收音中</span>
@@ -896,11 +858,6 @@
         STATE.rawMouse.x = e.clientX;
         STATE.rawMouse.y = e.clientY;
 
-        if (!document.body.classList.contains('ds-magnet-active')) {
-            document.body.classList.add('ds-magnet-active');
-            cursorEl.style.display = 'block';
-        }
-
         if (STATE.pickerMode) {
             updatePickerHighlightAt(e.clientX, e.clientY);
         }
@@ -1059,182 +1016,22 @@
             }
         }
 
-        if (e.code === 'Space' && !isInputFocused && curItem) {
-            e.preventDefault();
-            if (!STATE.spacePressed) {
-                STATE.spacePressed = true;
-                cursorEl.classList.add('ds-unlocked-space');
-                cursorEl.classList.remove('ds-locked');
-                updateStatusBadge('🔓 <b>空格已按住</b>：鼠标磁吸已解锁，可自由移动');
-            }
-        }
     }, { capture: true });
 
-    window.addEventListener('keyup', (e) => {
-        if (e.code === 'Space' && STATE.spacePressed) {
-            STATE.spacePressed = false;
-            cursorEl.classList.remove('ds-unlocked-space');
-            if (getCurrentTargetItem()) {
-                renderQueueStatus();
-            }
-        }
-    }, { capture: true });
-
-    function getTargetCenter() {
-        const curItem = getCurrentTargetItem();
-        if (!curItem || !curItem.el || !document.body.contains(curItem.el)) {
-            return null;
-        }
-        const rect = curItem.el.getBoundingClientRect();
-        if (rect.width === 0 || rect.height === 0) return null;
-        return {
-            x: rect.left + rect.width / 2,
-            y: rect.top + rect.height / 2,
-            rect
-        };
-    }
-
-    function updateMagnetPhysics() {
-        const target = getTargetCenter();
-        const dotEl = document.getElementById('ds-cursor-dot');
-
-        if (!STATE.enabled || !target || STATE.spacePressed || STATE.pickerMode) {
-            STATE.virtualMouse.x += (STATE.rawMouse.x - STATE.virtualMouse.x) * 0.45;
-            STATE.virtualMouse.y += (STATE.rawMouse.y - STATE.virtualMouse.y) * 0.45;
-            cursorEl.classList.remove('ds-locked');
-            if (dotEl) dotEl.setAttribute('opacity', '0');
-        } else {
-            const dxRaw = target.x - STATE.rawMouse.x;
-            const dyRaw = target.y - STATE.rawMouse.y;
-            const distFromRaw = Math.hypot(dxRaw, dyRaw);
-
-            if (distFromRaw <= CONFIG.magnetRadius) {
-                const normalizedDist = Math.max(0, Math.min(1, 1 - distFromRaw / CONFIG.magnetRadius));
-                const magnetWeight = Math.pow(normalizedDist, 1.35);
-
-                const desiredX = STATE.rawMouse.x + dxRaw * Math.min(0.96, magnetWeight * 1.15);
-                const desiredY = STATE.rawMouse.y + dyRaw * Math.min(0.96, magnetWeight * 1.15);
-
-                const pull = CONFIG.pullStrength + magnetWeight * 0.14;
-                STATE.virtualMouse.x += (desiredX - STATE.virtualMouse.x) * pull;
-                STATE.virtualMouse.y += (desiredY - STATE.virtualMouse.y) * pull;
-
-                const distVirtual = Math.hypot(target.x - STATE.virtualMouse.x, target.y - STATE.virtualMouse.y);
-                if (distVirtual <= CONFIG.lockRadius) {
-                    cursorEl.classList.add('ds-locked');
-                    if (dotEl) dotEl.setAttribute('opacity', '1');
-                } else {
-                    cursorEl.classList.remove('ds-locked');
-                    if (dotEl) dotEl.setAttribute('opacity', '0.5');
-                }
-            } else {
-                STATE.virtualMouse.x += (STATE.rawMouse.x - STATE.virtualMouse.x) * 0.4;
-                STATE.virtualMouse.y += (STATE.rawMouse.y - STATE.virtualMouse.y) * 0.4;
-                cursorEl.classList.remove('ds-locked');
-                if (dotEl) dotEl.setAttribute('opacity', '0');
-            }
-        }
-
-        cursorEl.style.transform = `translate3d(${STATE.virtualMouse.x - 3}px, ${STATE.virtualMouse.y - 2}px, 0)`;
-        // 触屏设备：先点“选题”，再点题目；不拦截普通滚动和点击。
-    if (/iPad/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)) {
-        const panel = document.createElement('div');
-        panel.setAttribute('data-ds-touch-panel', '');
-        panel.style.cssText = 'position:fixed;z-index:2147483647;left:8px;bottom:12px;display:flex;gap:4px;flex-wrap:wrap;max-width:95vw;background:#172235ee;padding:6px;border-radius:10px;box-shadow:0 2px 10px #0006';
-        let armed = false;
-        function addTouchButton(label, action) {
-            const b = document.createElement('button');
-            b.type = 'button'; b.textContent = label;
-            b.style.cssText = 'font:14px sans-serif;color:white;background:#30557d;border:0;border-radius:6px;padding:9px 10px;touch-action:manipulation';
-            b.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); action(); });
-            panel.appendChild(b); return b;
-        }
-        const selectButton = addTouchButton('选题分析', () => {
-            armed = !armed;
-            selectButton.textContent = armed ? '取消选题' : '选题分析';
-            updateStatusBadge(armed ? '👆 请点击要分析的题目或空格' : '已取消选题');
-        });
-        addTouchButton('填写', fillTargetInputInstantly);
-        addTouchButton('记文章', captureReadingPassageToMemory);
-        addTouchButton('设置Key', () => {
-            const key = prompt('请输入您的 DeepSeek API Key：', STATE.apiKey);
-            if (key !== null) { STATE.apiKey = key.trim(); GM_setValue('DEEPSEEK_API_KEY', STATE.apiKey); updateStatusBadge(STATE.apiKey ? '✅ API Key 已保存' : '⚠️ 未配置 API Key'); }
-        });
-        addTouchButton('收起', () => {
-            const hidden = panel.dataset.collapsed === '1';
-            panel.dataset.collapsed = hidden ? '0' : '1';
-            Array.from(panel.children).forEach((el, i) => { if (i < panel.children.length - 1) el.style.display = hidden ? '' : 'none'; });
-            panel.lastElementChild.textContent = hidden ? '收起' : '展开';
-        });
-        document.body.appendChild(panel);
-        window.addEventListener('click', e => {
-            if (!armed || panel.contains(e.target)) return;
-            e.preventDefault(); e.stopImmediatePropagation();
-            armed = false; selectButton.textContent = '选题分析';
-            STATE.rawMouse.x = e.clientX; STATE.rawMouse.y = e.clientY;
-            const scope = findSmartScopeFromMousePoint(e.clientX, e.clientY) || e.target;
-            analyzeCurrentPageQuestion(scope);
-        }, true);
-        window.addEventListener('touchstart', e => {
-            if (panel.contains(e.target) || !e.touches.length) return;
-            STATE.rawMouse.x = e.touches[0].clientX; STATE.rawMouse.y = e.touches[0].clientY;
-            STATE.virtualMouse.x = STATE.rawMouse.x; STATE.virtualMouse.y = STATE.rawMouse.y;
-        }, {passive: true});
-    }
-
-    requestAnimationFrame(updateMagnetPhysics);
-    }
-    requestAnimationFrame(updateMagnetPhysics);
-
-    /********************************************************************
-     * 10. 点击事件拦截
-     ********************************************************************/
+    // 普通点击不重定向；选题模式保留原来的锁定行为。
     window.addEventListener('click', (e) => {
-        if (e.target instanceof Element && e.target.closest('[data-ds-touch-panel]')) return;
         if (STATE.pickerMode) {
             e.stopPropagation();
             e.preventDefault();
             const chosenScope = STATE.hoveredScopeEl;
             toggleScopePickerMode(false);
-            if (chosenScope) {
-                analyzeCurrentPageQuestion(chosenScope);
-            }
-            return;
-        }
-
-        if (STATE.isRedirectingClick || !STATE.enabled || STATE.spacePressed) {
+            if (chosenScope) analyzeCurrentPageQuestion(chosenScope);
             return;
         }
         const curItem = getCurrentTargetItem();
-        if (!curItem || !curItem.el) return;
-
-        const offsetDist = Math.hypot(STATE.virtualMouse.x - e.clientX, STATE.virtualMouse.y - e.clientY);
-        const targetUnderVirtual = document.elementFromPoint(STATE.virtualMouse.x, STATE.virtualMouse.y);
-        const isHittingTarget = targetUnderVirtual &&
-            (curItem.el.contains(targetUnderVirtual) || targetUnderVirtual.contains(curItem.el));
-
-        if (offsetDist > 4 && isHittingTarget) {
-            e.stopPropagation();
-            e.preventDefault();
-
-            STATE.isRedirectingClick = true;
-            try {
-                if (STATE.questionType !== 'choice') {
-                    curItem.el.focus();
-                } else {
-                    const clickable = curItem.el.querySelector('input, label, a, button') || curItem.el;
-                    clickable.click();
-                    curItem.completed = true;
-                    advanceQueueIfNeeded();
-                }
-            } finally {
-                STATE.isRedirectingClick = false;
-            }
-        } else if (isHittingTarget && STATE.questionType === 'choice') {
-            setTimeout(() => {
-                curItem.completed = true;
-                advanceQueueIfNeeded();
-            }, 60);
+        if (curItem && curItem.el && STATE.questionType === 'choice' &&
+            (curItem.el.contains(e.target) || (e.target instanceof Element && e.target.contains(curItem.el)))) {
+            setTimeout(() => { curItem.completed = true; advanceQueueIfNeeded(); }, 60);
         }
     }, true);
 
@@ -1400,6 +1197,7 @@
 
     function analyzeCurrentPageQuestion(explicitScopeEl = null) {
         stopAutoHumanTyping();
+        STATE.apiKey = GM_getValue('DEEPSEEK_API_KEY', '') || STATE.apiKey;
         if (!STATE.apiKey) {
             const inputKey = prompt('尚未配置 DeepSeek API Key，请先输入 (sk-...):', '');
             if (!inputKey) return;
@@ -1627,10 +1425,10 @@
                 `<span style="color:#94a3b8">点击该空敲任意键输入 | <b>Tab</b> 秒填${altHint} | <b>Esc</b> 解锁</span>`
             );
         } else {
-            const multiHint = total > 1 ? ' (多选：点击后自动吸附下一项)' : '';
+            const multiHint = total > 1 ? ' (多选：点击当前提示选项后显示下一项)' : '';
             updateStatusBadge(
                 `✅ ${stepTag}锁定选项：<b>${escapeHtml(cur.text.slice(0, 24))}</b>${multiHint}<br>` +
-                `<span style="color:#94a3b8">靠近选项自动吸附 | 按住 <b>空格</b> 解锁鼠标</span>`
+                `<span style="color:#94a3b8">请点击高亮提示的选项</span>`
             );
         }
     }
