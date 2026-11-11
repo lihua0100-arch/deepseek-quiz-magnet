@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         DeepSeek 智能题库解析与磁吸自瞄助手 Pro (3.1 U校园/选词填空精准定位版)
 // @namespace    https://tampermonkey.net/
-// @version      3.3.0
+// @version      3.5.0
 // @updateURL    https://raw.githubusercontent.com/lihua0100-arch/deepseek-quiz-magnet/main/deepseek-quiz-magnet.user.js
 // @downloadURL  https://raw.githubusercontent.com/lihua0100-arch/deepseek-quiz-magnet/main/deepseek-quiz-magnet.user.js
-// @description  修复U校园等平台多空选词填空“指第5空却识别到第6空/漏识别空格位置”的问题：精准将<input>原位转写为[[👉当前目标空格👈]]标记、自动抓取滚动区上方词库框(words in the box)、支持单行题块与已填词排除法。
+// @description  U校园与学习通题目解析助手，支持鼠标指题、选题和快捷键；嵌入页面请在题目所在区域操作。
 // @author       Gemini
 // @match        *://*/*
 // @allFrames    true
@@ -19,10 +19,12 @@
 (function () {
     'use strict';
 
+    // 过滤面积极小的隐藏统计/广告 iframe
     if (window.self !== window.top && (window.innerWidth < 120 || window.innerHeight < 80)) {
         return;
     }
 
+    const IS_TOP = window.self === window.top;
     const IS_MAC = /Mac|iPod|iPhone|iPad/i.test(navigator.platform || navigator.userAgent);
     const MOD_KEY_LABEL = IS_MAC ? '⌃Ctrl(或⌥Opt)' : 'Alt';
 
@@ -31,8 +33,8 @@
      ********************************************************************/
     const CONFIG = {
         apiUrl: 'https://api.deepseek.com/chat/completions',
-        showVisualHint: true,     // 是否显示状态栏及提示
-        enableStealthTyping: true // 填空/翻译/简答题是否开启“任意键伪装盲打”
+        showVisualHint: true,
+        enableStealthTyping: true
     };
 
     const STATE = {
@@ -50,58 +52,81 @@
         autoTypingTimer: null,
         isAnalyzing: false,
         rawMouse: { x: window.innerWidth / 2, y: window.innerHeight / 2 },
+        lastMouseMoveAt: Date.now(), // 记录鼠标最后一次在当前 frame 活动的时间戳
 
-        questionType: 'choice',   // 'choice' | 'input' | 'translate' | 'essay'
-        targetQueue: [],          // [{ el, text, altFormats: [], completed: false }]
+        questionType: 'choice',      // 'choice' | 'input' | 'translate' | 'essay'
+        targetQueue: [],             // [{ el, text, altFormats: [], completed: false }]
         currentQueueIdx: 0,
         altFormatIdx: 0,
-        typingCursorIndex: 0,
+        typingCursorIndex: 0
     };
 
-    /********************************************************************
-     * 2. 油猴扩展菜单注册
-     ********************************************************************/
-    GM_registerMenuCommand('🔑 设置 DeepSeek API Key', () => {
-        const key = prompt('请输入您的 DeepSeek API Key (sk-...):', STATE.apiKey);
-        if (key !== null) {
-            STATE.apiKey = key.trim();
-            GM_setValue('DEEPSEEK_API_KEY', STATE.apiKey);
-            updateStatusBadge(STATE.apiKey ? `✅ API Key 已保存 (${MOD_KEY_LABEL}+Q 分析题目)` : '⚠️ 未配置 API Key');
+    // 命令在题目所在框架中执行。
+    function executeCommandLocally(cmd) {
+        if (cmd === 'ANALYZE') analyzeCurrentPageQuestion();
+        else if (cmd === 'SAVE_PASSAGE') captureReadingPassageToMemory();
+        else if (cmd === 'CLEAR_PASSAGE') clearSavedReadingPassage();
+        else if (cmd === 'TOGGLE_ASR') toggleListeningSpeechRecognition();
+        else if (cmd === 'TOGGLE_PICKER') toggleScopePickerMode();
+        else if (cmd === 'TOGGLE_AUTOTYPE') toggleAutoHumanTyping();
+        else if (cmd === 'FILL_INSTANT') fillTargetInputInstantly();
+        else if (cmd === 'CYCLE_ALT') cycleAlternativeAnswerFormat();
+        else if (cmd === 'TOGGLE_MODEL') toggleModelMode();
+        else if (cmd === 'TOGGLE_UI') {
+            CONFIG.showVisualHint = !CONFIG.showVisualHint;
+            toggleVisualUI(CONFIG.showVisualHint);
         }
-    });
+    }
 
-    GM_registerMenuCommand(`🎯 智能分析鼠标指向的题目/空格 (${MOD_KEY_LABEL}+Q)`, () => {
-        analyzeCurrentPageQuestion();
-    });
+    function dispatchSmartCommand(cmd) {
+        executeCommandLocally(cmd);
+    }
 
-    GM_registerMenuCommand(`📚 跨页记忆当前阅读文章/词库 (${MOD_KEY_LABEL}+C)`, () => {
-        captureReadingPassageToMemory();
-    });
+    /********************************************************************
+     * 3. 油猴扩展菜单注册 (仅在顶层窗口注册，避免菜单重复)
+     ********************************************************************/
+    if (IS_TOP) {
+        GM_registerMenuCommand('🔑 设置 DeepSeek API Key', () => {
+            const key = prompt('请输入您的 DeepSeek API Key (sk-...):', STATE.apiKey);
+            if (key !== null && key.trim()) {
+                STATE.apiKey = key.trim();
+                GM_setValue('DEEPSEEK_API_KEY', STATE.apiKey);
+                updateStatusBadge(STATE.apiKey ? `✅ API Key 已保存 (${MOD_KEY_LABEL}+Q 或 ${MOD_KEY_LABEL}+左键点题)` : '⚠️ 未配置 API Key');
+            }
+        });
 
-    GM_registerMenuCommand(`🗑️ 清空已记忆的跨页阅读文章 (${MOD_KEY_LABEL}+X)`, () => {
-        clearSavedReadingPassage();
-    });
+        GM_registerMenuCommand(`🎯 智能分析当前题目 (${MOD_KEY_LABEL}+Q / ${MOD_KEY_LABEL}+左键点击)`, () => {
+            dispatchSmartCommand('ANALYZE');
+        });
 
-    GM_registerMenuCommand(`🎧 开启/停止听力实时语音识别 (${MOD_KEY_LABEL}+L)`, () => {
-        toggleListeningSpeechRecognition();
-    });
+        GM_registerMenuCommand(`📚 跨页记忆当前阅读文章/词库 (${MOD_KEY_LABEL}+C)`, () => {
+            dispatchSmartCommand('SAVE_PASSAGE');
+        });
 
-    GM_registerMenuCommand(`🔍 开启“指哪打哪”选题瞄准器 (${MOD_KEY_LABEL}+S)`, () => {
-        toggleScopePickerMode();
-    });
+        GM_registerMenuCommand(`🗑️ 清空已记忆的跨页阅读文章 (${MOD_KEY_LABEL}+X)`, () => {
+            dispatchSmartCommand('CLEAR_PASSAGE');
+        });
 
-    GM_registerMenuCommand(`🤖 启动/暂停拟真自动打字机 (${MOD_KEY_LABEL}+A)`, () => {
-        toggleAutoHumanTyping();
-    });
+        GM_registerMenuCommand(`🎧 开启/停止听力实时语音识别 (${MOD_KEY_LABEL}+L)`, () => {
+            dispatchSmartCommand('TOGGLE_ASR');
+        });
 
-    GM_registerMenuCommand(`🧠 切换模型: V3极速 / R1深度推理 (${MOD_KEY_LABEL}+M)`, () => {
-        toggleModelMode();
-    });
+        GM_registerMenuCommand(`🔍 开启“指哪打哪”选题瞄准器 (${MOD_KEY_LABEL}+S)`, () => {
+            dispatchSmartCommand('TOGGLE_PICKER');
+        });
 
-    GM_registerMenuCommand(`👁️ 切换状态栏显示 (${MOD_KEY_LABEL}+H)`, () => {
-        CONFIG.showVisualHint = !CONFIG.showVisualHint;
-        toggleVisualUI(CONFIG.showVisualHint);
-    });
+        GM_registerMenuCommand(`🤖 启动/暂停拟真自动打字机 (${MOD_KEY_LABEL}+A)`, () => {
+            dispatchSmartCommand('TOGGLE_AUTOTYPE');
+        });
+
+        GM_registerMenuCommand(`🧠 切换模型: V3极速 / R1深度推理 (${MOD_KEY_LABEL}+M)`, () => {
+            dispatchSmartCommand('TOGGLE_MODEL');
+        });
+
+        GM_registerMenuCommand(`👁️ 切换状态栏显示 (${MOD_KEY_LABEL}+H)`, () => {
+            dispatchSmartCommand('TOGGLE_UI');
+        });
+    }
 
     function toggleModelMode() {
         STATE.model = STATE.model === 'deepseek-chat' ? 'deepseek-reasoner' : 'deepseek-chat';
@@ -113,7 +138,7 @@
     }
 
     /********************************************************************
-     * 3. 虚拟磁吸光标、解除网页禁选限制与 UI 构建
+     * 4. 样式注入、解除网页禁选限制与唯一顶层状态栏构建
      ********************************************************************/
     const styleEl = document.createElement('style');
     styleEl.textContent = `
@@ -121,33 +146,36 @@
             -webkit-user-select: text !important;
             -moz-user-select: text !important;
             user-select: text !important;
+            -webkit-touch-callout: default !important;
         }
         #ds-status-badge {
             position: fixed;
             bottom: 16px;
             right: 16px;
             z-index: 2147483646;
-            background: rgba(15, 23, 42, 0.92);
+            background: rgba(15, 23, 42, 0.94);
             color: #f8fafc;
             font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", system-ui, sans-serif;
             font-size: 12px;
             line-height: 1.5;
-            padding: 8px 12px;
-            border-radius: 8px;
-            border: 1px solid rgba(148, 163, 184, 0.25);
-            box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
-            backdrop-filter: blur(6px);
-            -webkit-backdrop-filter: blur(6px);
+            padding: 9px 13px;
+            border-radius: 10px;
+            border: 1px solid rgba(148, 163, 184, 0.28);
+            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
             user-select: none !important;
-            max-width: 400px;
+            max-width: 410px;
         }
         .ds-correct-option-hint {
-            outline: 2px dashed rgba(16, 185, 129, 0.75) !important;
+            outline: 2px dashed rgba(16, 185, 129, 0.9) !important;
             outline-offset: 2px !important;
-            background-color: rgba(16, 185, 129, 0.06) !important;
+            background-color: rgba(16, 185, 129, 0.12) !important;
+            box-shadow: 0 0 8px rgba(16, 185, 129, 0.35) !important;
+            border-radius: 4px !important;
         }
         .ds-secondary-option-hint {
-            outline: 1px dotted rgba(56, 189, 248, 0.5) !important;
+            outline: 1.5px dotted rgba(56, 189, 248, 0.65) !important;
             outline-offset: 2px !important;
         }
         .ds-scope-picker-highlight {
@@ -165,23 +193,28 @@
     document.head.appendChild(styleEl);
 
     window.addEventListener('selectstart', (e) => e.stopPropagation(), true);
+    window.addEventListener('copy', (e) => e.stopPropagation(), true);
 
-    const badgeEl = document.createElement('div');
-    badgeEl.id = 'ds-status-badge';
-    badgeEl.innerHTML = `
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:2px;gap:6px;">
-            <span style="font-weight:600;color:#38bdf8;">🎯 DeepSeek 题库助手 3.3</span>
-            <div style="display:flex;gap:4px;">
-                <span id="ds-mem-tag" style="font-size:10px;background:#065f46;padding:1px 5px;border-radius:4px;color:#a7f3d0;display:${STATE.savedPassage ? 'inline-block' : 'none'};">📚已存阅读(${STATE.savedPassage.length}字)</span>
-                <span id="ds-asr-tag" style="font-size:10px;background:#991b1b;padding:1px 5px;border-radius:4px;color:#fecaca;display:none;">🎙️听力收音中</span>
-                <span id="ds-model-tag" style="font-size:10px;background:#1e293b;padding:1px 6px;border-radius:4px;color:#94a3b8;">${STATE.model === 'deepseek-reasoner' ? 'R1推理' : 'V3极速'}</span>
+    let badgeEl = null;
+    {
+        badgeEl = document.createElement('div');
+        badgeEl.id = 'ds-status-badge';
+        badgeEl.innerHTML = `
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;gap:6px;">
+                <span style="font-weight:600;color:#38bdf8;">🎯 DeepSeek 题库助手 Pro 3.5</span>
+                <div style="display:flex;gap:4px;">
+                    <span id="ds-mem-tag" style="font-size:10px;background:#065f46;padding:1px 5px;border-radius:4px;color:#a7f3d0;display:${STATE.savedPassage ? 'inline-block' : 'none'};">📚已存阅读(${STATE.savedPassage.length}字)</span>
+                    <span id="ds-asr-tag" style="font-size:10px;background:#991b1b;padding:1px 5px;border-radius:4px;color:#fecaca;display:none;">🎙️听力收音中</span>
+                    <span id="ds-model-tag" style="font-size:10px;background:#1e293b;padding:1px 6px;border-radius:4px;color:#94a3b8;">${STATE.model === 'deepseek-reasoner' ? 'R1推理' : 'V3极速'}</span>
+                </div>
             </div>
-        </div>
-        <div id="ds-status-text">指题/指空按 <b>${MOD_KEY_LABEL}+Q</b> | 存阅读/词库 <b>${MOD_KEY_LABEL}+C</b></div>
-    `;
-    document.body.appendChild(badgeEl);
+            <div id="ds-status-text">指题按 <b>${MOD_KEY_LABEL}+Q</b> 或 <b>按住${MOD_KEY_LABEL}+左键点题</b> | 存阅读 <b>${MOD_KEY_LABEL}+C</b></div>
+        `;
+        document.body.appendChild(badgeEl);
+    }
 
-    function updateStatusBadge(msg) {
+    function renderBadgeDOM(msg, isASR = STATE.isListeningASR) {
+        if (!badgeEl) return;
         const textNode = document.getElementById('ds-status-text');
         const modelTag = document.getElementById('ds-model-tag');
         const memTag = document.getElementById('ds-mem-tag');
@@ -193,25 +226,76 @@
             memTag.textContent = `📚已存阅读(${STATE.savedPassage.length}字)`;
         }
         if (asrTag) {
-            asrTag.style.display = STATE.isListeningASR ? 'inline-block' : 'none';
+            asrTag.style.display = isASR ? 'inline-block' : 'none';
         }
     }
 
+    function updateStatusBadge(msg) {
+        renderBadgeDOM(msg, STATE.isListeningASR);
+    }
+
     /********************************************************************
-     * 4. 跨页面长阅读 / 词库记忆库 (Ctrl/Alt + C 存入，Ctrl/Alt + X 清空)
+     * 5. U校园 AI版 5.0 (uai.unipus.cn / ucontent.unipus.cn) 与学习通全题型选择器
+     ********************************************************************/
+    const COMMON_CONTAINER_SELECTORS = [
+        // U校园 AI版 5.0 专属题块容器
+        '[class*="question-wrapper"]', '[class*="question-container"]', '[class*="exercise-item"]',
+        '[class*="task-item"]', '[class*="stem"]', '[class*="quiz-item"]', '.unipus-question',
+        // 学习通 / 超星尔雅专属类名
+        '.TiMu', '.singleQuesId', '.questionLi', '.padBom50', '.font-cxsecret',
+        // 通用在线题库
+        '.question-item', '.question-box', '.question-card', '.exam-item',
+        '.subject-item', '.q-item', '.ti-item', '.problem-item',
+        '[class*="question"]', '[class*="subject"]', '[class*="topic"]',
+        'fieldset', 'article', 'li', 'p', 'div'
+    ];
+
+    const COMMON_OPTION_SELECTORS = [
+        // U校园 AI版 / AntDesign / React 常见选项类名
+        '.ant-radio-wrapper', '.ant-checkbox-wrapper', '[class*="radio-item"]', '[class*="checkbox-item"]',
+        '[class*="option-wrap"]', '[class*="option-item"]', '[class*="optionItem"]', '[class*="choice-item"]',
+        '[class*="select-option"]', '.ant-select-item-option',
+        // 学习通专属选择器
+        '.single_choice li', '.multi_choice li', '.true_false li',
+        '.answerList li', '.answerBg', '.ans-checkbox', '.ans-radio',
+        '.marBom6', '.ul-list li', '.clearfix li',
+        // 通用题库
+        '.option', '.options li', '.question-option', '.answer-item',
+        '.el-radio', '.el-checkbox', 'label', 'li[role="option"]', 'div[role="radio"]', 'div[role="checkbox"]'
+    ];
+
+    const COMMON_INPUT_SELECTORS = [
+        'textarea',
+        '[contenteditable="true"]',
+        '[role="textbox"]',
+        '.ql-editor', '.w-e-text', '.ProseMirror', '.edui-body-container',
+        'input[type="text"]', 'input:not([type])', 'input[type="search"]', 'input[type="number"]', 'input[type="tel"]'
+    ];
+
+    // U校园特有的“非 input 伪空格”（如选词填空拖拽格、点选填空横线、段落信息匹配下拉框）
+    const UNIPUS_PSEUDO_BLANK_SELECTORS = [
+        '[class*="cloze-blank"]', '[class*="blank-item"]', '[class*="blank-box"]',
+        '[class*="drop-target"]', '[class*="droppable"]', '[data-blank]', '[data-index][class*="blank"]',
+        '.ant-select-selector', '[class*="select-blank"]'
+    ];
+
+    /********************************************************************
+     * 6. 跨页面长阅读 / 词库记忆库 (Ctrl/Alt + C 存入，Ctrl/Alt + X 清空)
      ********************************************************************/
     function captureReadingPassageToMemory() {
         let text = window.getSelection()?.toString().trim() || '';
 
         if (!text) {
             const hitEl = document.elementFromPoint(STATE.rawMouse.x, STATE.rawMouse.y);
-            const passageContainer = hitEl?.closest('article, .passage, .reading-content, .article-content, .material, [class*="passage"], [class*="article"], [class*="reading"], [class*="word"]');
+            const passageContainer = hitEl?.closest(
+                'article, .passage, .reading-content, .article-content, .material, [class*="passage"], [class*="article"], [class*="reading"], [class*="word"], [class*="material"]'
+            );
             if (passageContainer) {
                 text = extractRichTextWithBlanks(passageContainer);
             } else {
                 const blocks = querySelectorAllDeep('article, section, div, p').filter(el => {
                     const r = el.getBoundingClientRect();
-                    return r.width > 200 && r.height > 60 && el.children.length < 30;
+                    return r.width > 180 && r.height > 50 && el.children.length < 35;
                 });
                 let longest = '';
                 for (const b of blocks) {
@@ -229,6 +313,7 @@
             return;
         }
 
+        STATE.savedPassage = GM_getValue('DEEPSEEK_SAVED_PASSAGE', '');
         if (STATE.savedPassage && !STATE.savedPassage.includes(text.slice(0, 40))) {
             STATE.savedPassage = (STATE.savedPassage + '\n\n' + text).slice(-6000);
         } else {
@@ -249,7 +334,7 @@
     }
 
     /********************************************************************
-     * 5. 听力题双引擎解决方案 (Ctrl/Alt + L)
+     * 7. 听力题双引擎解决方案 (Ctrl/Alt + L)
      ********************************************************************/
     function toggleListeningSpeechRecognition() {
         const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -316,7 +401,7 @@
 
     function extractHiddenListeningClues() {
         const clues = [];
-        document.querySelectorAll('[class*="script"], [class*="transcript"], [class*="listening-text"], [class*="lyric"]').forEach(el => {
+        document.querySelectorAll('[class*="script"], [class*="transcript"], [class*="listening-text"], [class*="lyric"], [class*="audio-text"]').forEach(el => {
             const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
             if (t.length > 20 && t.length < 3000) clues.push(t);
         });
@@ -327,27 +412,24 @@
     }
 
     /********************************************************************
-     * 6. 核心升级：带 <input> 原位占位标记的富文本提取器 + 滚动容器全景上下文抓取
-     *    彻底解决 U校园 等选词填空题：
-     *    1) <input> 在 innerText 中消失导致模型不知道横线在哪的问题；
-     *    2) 其它题已填单词(如 arrangement, ambitious)被吞掉导致无法排除的问题；
-     *    3) 方框词库(words in the box)滚出屏幕上方导致模型看不见备选词的问题。
+     * 8. 富文本与空格原位占位标记提取器 (兼容 U校园 真实输入框与拖拽伪空格)
      ********************************************************************/
     function extractRichTextWithBlanks(node, targetBlankEl = null) {
         if (!node) return '';
 
-        // 在真实 DOM 上临时写入 data-ds-blank-marker 属性，克隆后再替换为文本占位符，最后清理属性
-        const inputSelector = 'input, textarea, [contenteditable="true"], [role="textbox"]';
-        const liveInputs = Array.from(node.querySelectorAll ? node.querySelectorAll(inputSelector) : []);
+        const combinedBlankSelector = [...COMMON_INPUT_SELECTORS, ...UNIPUS_PSEUDO_BLANK_SELECTORS].join(',');
+        const liveInputs = Array.from(node.querySelectorAll ? node.querySelectorAll(combinedBlankSelector) : []);
         const cleanupList = [];
 
         liveInputs.forEach((inp, idx) => {
             if (inp.type === 'hidden' || inp.type === 'radio' || inp.type === 'checkbox' || inp.type === 'button' || inp.type === 'submit') {
                 return;
             }
-            const curVal = (inp.isContentEditable ? inp.innerText : inp.value || '').trim();
+            const curVal = (inp.tagName === 'INPUT' || inp.tagName === 'TEXTAREA'
+                ? inp.value
+                : inp.innerText || '').trim();
             let marker = '';
-            if (targetBlankEl && inp === targetBlankEl) {
+            if (targetBlankEl && (inp === targetBlankEl || inp.contains(targetBlankEl) || targetBlankEl.contains(inp))) {
                 marker = curVal
                     ? ` [[👉当前目标空格_${idx}(当前框内文字:"${curVal}")👈]] `
                     : ` [[👉当前需要作答的目标空格_${idx}👈]] `;
@@ -360,36 +442,32 @@
             cleanupList.push(inp);
         });
 
-        // 若 node 本身就是一个 input
         if (liveInputs.length === 0 && isEditableElement(node)) {
-            const curVal = (node.isContentEditable ? node.innerText : node.value || '').trim();
+            const curVal = (node.tagName === 'INPUT' || node.tagName === 'TEXTAREA' ? node.value : node.innerText || '').trim();
             return curVal ? `[[👉当前目标空格(已填:"${curVal}")👈]]` : `[[👉当前需要作答的目标空格👈]]`;
         }
 
         const clone = node.cloneNode(true);
-
-        // 清理真实 DOM 上的临时属性
         cleanupList.forEach(inp => inp.removeAttribute('data-ds-blank-marker'));
 
-        // 1. 将克隆树中的空格标记替换为清晰的显式文本占位符
+        // 过滤干扰图标与隐藏样式
+        clone.querySelectorAll('style, script, .ans-icon, .font-cxsecret-ignore').forEach(el => el.remove());
+
         clone.querySelectorAll('[data-ds-blank-marker]').forEach(el => {
             const markerText = el.getAttribute('data-ds-blank-marker') || ' [[空格]] ';
             el.replaceWith(markerText);
         });
 
-        // 2. 提取 KaTeX / MathML 中的 TeX 源码
         clone.querySelectorAll('annotation[encoding="application/x-tex"]').forEach(ann => {
             ann.replaceWith(` $${ann.textContent.trim()}$ `);
         });
         clone.querySelectorAll('.katex-html, .MathJax_Preview').forEach(el => el.remove());
 
-        // 3. 提取 MathJax 或 data-latex 公式
         clone.querySelectorAll('script[type^="math/tex"], [data-latex], [data-math], [data-tex]').forEach(el => {
             const tex = el.getAttribute('data-latex') || el.getAttribute('data-math') || el.getAttribute('data-tex') || el.textContent;
             if (tex) el.replaceWith(` $${tex.trim()}$ `);
         });
 
-        // 4. 提取图片 alt / title
         clone.querySelectorAll('img').forEach(img => {
             const alt = img.getAttribute('alt') || img.getAttribute('title') || img.getAttribute('data-latex') || '';
             if (alt && alt.trim().length > 0) {
@@ -400,7 +478,6 @@
         return (clone.innerText || clone.textContent || '').replace(/\s+/g, ' ').trim();
     }
 
-    // 抓取当前题块所在的整个滚动容器文本（含滚出视野上方的 Directions、方框词库 words in the box 以及同组其它句子）
     function extractScrollContainerFullContext(scopeRoot, primaryInputEl) {
         let curr = scopeRoot || primaryInputEl;
         let scrollContainer = null;
@@ -409,21 +486,21 @@
             const style = window.getComputedStyle(curr);
             const isScrollable = /(auto|scroll)/i.test(style.overflowY + style.overflow) || curr.scrollHeight > curr.clientHeight + 40;
             const textLen = (curr.innerText || '').length;
-            if (isScrollable && textLen >= 100 && textLen <= 8000) {
+            if (isScrollable && textLen >= 80 && textLen <= 8500) {
                 scrollContainer = curr;
                 break;
             }
-            if (textLen >= 250 && textLen <= 5000) {
+            if (textLen >= 200 && textLen <= 5500) {
                 scrollContainer = curr;
             }
             curr = curr.parentElement;
         }
 
         if (!scrollContainer) {
-            scrollContainer = document.querySelector('.ant-tabs-tabpane-active, .el-tab-pane, main, article') || document.body;
+            scrollContainer = document.querySelector('.ant-tabs-tabpane-active, .el-tab-pane, main, article, .padBom50, .TiMu') || document.body;
         }
 
-        return extractRichTextWithBlanks(scrollContainer, primaryInputEl).slice(0, 3500);
+        return extractRichTextWithBlanks(scrollContainer, primaryInputEl).slice(0, 3800);
     }
 
     function extractSectionHeaderAndDirections(scopeRoot) {
@@ -433,10 +510,9 @@
             let prev = curr.previousElementSibling;
             let steps = 0;
             while (prev && steps < 8) {
-                // 不受视口顶部限制，即使 Directions 滚到了上方也照样提取
                 const txt = extractRichTextWithBlanks(prev);
                 if (txt.length >= 2 && txt.length <= 500 &&
-                    /翻译|译成|译文|Translate|Translation|阅读|Reading|听力|Listening|选词填空|完形|Cloze|简答|写作|Writing|Part|Section|Directions|words in the box/i.test(txt)) {
+                    /翻译|译成|译文|Translate|Translation|阅读|Reading|听力|Listening|选词填空|完形|Cloze|简答|写作|Writing|Part|Section|Directions|words in the box|bank|单选题|多选题|判断题|填空题/i.test(txt)) {
                     headers.unshift(txt);
                 }
                 prev = prev.previousElementSibling;
@@ -445,9 +521,9 @@
             curr = curr.parentElement;
         }
 
-        document.querySelectorAll('h1, h2, h3, h4, [class*="section-title"], [class*="part-title"], [class*="directions"], [class*="word-box"], [class*="word-bank"]').forEach(el => {
+        document.querySelectorAll('h1, h2, h3, h4, [class*="section-title"], [class*="part-title"], [class*="directions"], [class*="word-box"], [class*="word-bank"], [class*="word-list"], .font14').forEach(el => {
             const t = extractRichTextWithBlanks(el);
-            if (t.length >= 2 && t.length <= 500 && !headers.includes(t)) {
+            if (t.length >= 2 && t.length <= 600 && !headers.includes(t)) {
                 headers.push(t);
             }
         });
@@ -457,20 +533,21 @@
 
     function findSamePageReadingPassage(scopeRoot) {
         const candidates = querySelectorAllDeep(
-            'article, .passage, .reading-passage, .article-body, [class*="passage"], [class*="reading"], [class*="material"], [class*="word-box"], [class*="word-bank"]'
+            'article, .passage, .reading-passage, .article-body, [class*="passage"], [class*="reading"], [class*="material"], [class*="word-box"], [class*="word-bank"], [class*="word-list"]'
         );
+        const snippets = [];
         for (const el of candidates) {
             if (scopeRoot && scopeRoot.contains(el)) continue;
             const t = extractRichTextWithBlanks(el);
-            if (t.length >= 30 && t.length <= 6500) {
-                return t;
+            if (t.length >= 20 && t.length <= 6500 && !snippets.includes(t)) {
+                snippets.push(t);
             }
         }
-        return '';
+        return snippets.slice(0, 2).join('\n\n');
     }
 
     /********************************************************************
-     * 7. 精准定位鼠标指向的单个空格 / 单行题块（修复 U校园 单行高度 <28px 漏判）
+     * 9. 精准定位鼠标指向的题目/空格
      ********************************************************************/
     function clearTargetHighlights() {
         document.querySelectorAll('.ds-correct-option-hint, .ds-secondary-option-hint').forEach(el => {
@@ -485,6 +562,7 @@
             if (!item.el || item.completed) return;
             if (idx === STATE.currentQueueIdx) {
                 item.el.classList.add('ds-correct-option-hint');
+                try { item.el.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); } catch (_) {}
             } else {
                 item.el.classList.add('ds-secondary-option-hint');
             }
@@ -500,7 +578,7 @@
     }
 
     function toggleVisualUI(visible) {
-        badgeEl.style.display = visible ? 'block' : 'none';
+        if (badgeEl) badgeEl.style.display = visible ? 'block' : 'none';
         refreshTargetHighlights();
     }
 
@@ -508,11 +586,9 @@
         return STATE.targetQueue[STATE.currentQueueIdx] || null;
     }
 
-    // 找到离当前鼠标指针最近（或当前已点击聚焦）的单个输入框
     function findNearestInputToMouse(inputsList) {
         if (!inputsList || inputsList.length === 0) return null;
 
-        // 1. 如果用户当前已经点击聚焦了其中某个输入框，且鼠标离它不远(<220px)，优先以聚焦框为准
         const activeEl = document.activeElement;
         const focusedItem = inputsList.find(item => item.el === activeEl || item.el.contains(activeEl));
         if (focusedItem) {
@@ -521,10 +597,9 @@
                 (r.left + r.width / 2) - STATE.rawMouse.x,
                 (r.top + r.height / 2) - STATE.rawMouse.y
             );
-            if (distToMouse < 220) return focusedItem;
+            if (distToMouse < 240) return focusedItem;
         }
 
-        // 2. 计算可视区域所有输入框与当前鼠标 (rawMouse.x, rawMouse.y) 的几何距离，取最近的那个框！
         let closest = inputsList[0];
         let minDist = Infinity;
         for (const item of inputsList) {
@@ -543,8 +618,7 @@
     function scoreQuestionContainer(node) {
         if (!node || node === document.body || node === document.documentElement) return { valid: false };
         const rect = node.getBoundingClientRect();
-        // 支持 U校园 等单行填空句子（高度放宽至 >=16px）
-        if (rect.width < 90 || rect.height < 16) return { valid: false };
+        if (rect.width < 80 || rect.height < 16) return { valid: false };
         if (rect.height > window.innerHeight * 0.92 && node.children.length > 4) return { valid: false };
 
         const options = extractOptionsInsideScope(node, false);
@@ -552,7 +626,7 @@
         const fullText = extractRichTextWithBlanks(node);
 
         const hasInteractiveItems = options.length >= 2 || inputs.length >= 1;
-        const hasStemOrPureListening = fullText.length >= 4 || options.length >= 3;
+        const hasStemOrPureListening = fullText.length >= 4 || options.length >= 2;
 
         return {
             valid: hasInteractiveItems && hasStemOrPureListening,
@@ -568,14 +642,28 @@
             return null;
         }
 
+        // U校园的简答题题干与 textarea 同处此题块，避免只选中不含题干的输入框容器。
+        const unipusReply = hitEl.closest('.question-common-abs-reply, .question-inputbox');
+        if (unipusReply && unipusReply.querySelector('textarea, input, [contenteditable="true"]')) {
+            return unipusReply;
+        }
+
+        // 如果鼠标直接指在某个深层 iframe 标签上，尝试进入该同源 iframe 查找
+        if (hitEl.tagName === 'IFRAME') {
+            try {
+                if (hitEl.contentDocument?.body) {
+                    return hitEl.contentDocument.body;
+                }
+            } catch (_) {}
+        }
+
         let curr = hitEl;
         let depth = 0;
         let fallbackCandidate = null;
 
-        while (curr && curr !== document.body && depth < 12) {
+        while (curr && curr !== document.body && depth < 14) {
             const evalRes = scoreQuestionContainer(curr);
             if (evalRes.valid) {
-                // 如果找到了刚好只包含 1 个填空输入框的单句容器（如 U校园 的第 5 题整句），立刻精准返回！
                 if (evalRes.optionsCount === 0 && evalRes.inputsCount === 1) {
                     return curr;
                 }
@@ -590,15 +678,9 @@
 
         if (fallbackCandidate) return fallbackCandidate;
 
-        const commonSelectors = [
-            '.question-item', '.question-box', '.question-card', '.exam-item',
-            '.subject-item', '.q-item', '.ti-item', '.problem-item',
-            '[class*="question"]', '[class*="subject"]', '[class*="topic"]',
-            'fieldset', 'article', 'li', 'p', 'div'
-        ];
-        const candidates = querySelectorAllDeep(commonSelectors.join(',')).filter(el => {
+        const candidates = querySelectorAllDeep(COMMON_CONTAINER_SELECTORS.join(',')).filter(el => {
             const r = el.getBoundingClientRect();
-            return r.width > 140 && r.height >= 16 && r.height < window.innerHeight * 0.85 &&
+            return r.width > 120 && r.height >= 16 && r.height < window.innerHeight * 0.88 &&
                    r.bottom > 0 && r.top < window.innerHeight;
         });
 
@@ -612,7 +694,6 @@
             const dx = Math.max(r.left - x, 0, x - r.right);
             const dy = Math.max(r.top - y, 0, y - r.bottom);
             const dist = Math.hypot(dx, dy);
-            // 优先奖励只含 1 个输入框的紧凑单句容器
             const singleInputBonus = evalRes.inputsCount === 1 ? 0 : 180;
             const score = dist * 1000 + Math.sqrt(evalRes.area) + singleInputBonus;
             if (score < minScore) {
@@ -643,7 +724,7 @@
     function updatePickerHighlightAt(x, y) {
         if (!STATE.pickerMode) return;
         const smartScope = findSmartScopeFromMousePoint(x, y) || document.elementFromPoint(x, y);
-        if (smartScope && smartScope !== STATE.hoveredScopeEl && smartScope !== badgeEl && !badgeEl.contains(smartScope)) {
+        if (smartScope && smartScope !== STATE.hoveredScopeEl && smartScope !== badgeEl && (!badgeEl || !badgeEl.contains(smartScope))) {
             if (STATE.hoveredScopeEl) {
                 STATE.hoveredScopeEl.classList.remove('ds-scope-picker-highlight');
             }
@@ -682,12 +763,13 @@
     }, { passive: false, capture: true });
 
     /********************************************************************
-     * 8. 输入框赋值器、拟真自动打字机与多版本切换
+     * 10. 输入框赋值器、拟真自动打字机与多版本切换
      ********************************************************************/
     function isEditableElement(el) {
         if (!el) return false;
         const tag = el.tagName;
-        return tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable || el.getAttribute?.('role') === 'textbox';
+        return tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable ||
+               el.getAttribute?.('role') === 'textbox' || el.classList?.contains('edui-body-container');
     }
 
     function setNativeInputValue(el, newText) {
@@ -697,9 +779,7 @@
         el.dispatchEvent(new KeyboardEvent('keydown', { key: lastChar, bubbles: true }));
         el.dispatchEvent(new InputEvent('beforeinput', { inputType: 'insertText', data: lastChar, bubbles: true }));
 
-        if (el.isContentEditable || el.getAttribute?.('role') === 'textbox') {
-            el.innerText = newText;
-        } else {
+        if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
             const proto = el.tagName === 'TEXTAREA'
                 ? window.HTMLTextAreaElement.prototype
                 : window.HTMLInputElement.prototype;
@@ -709,6 +789,8 @@
             } else {
                 el.value = newText;
             }
+        } else if (el.isContentEditable || el.classList?.contains('edui-body-container')) {
+            el.innerText = newText;
         }
 
         el.dispatchEvent(new InputEvent('input', { inputType: 'insertText', data: lastChar, bubbles: true }));
@@ -852,11 +934,12 @@
     }
 
     /********************************************************************
-     * 9. 鼠标磁吸、全局快捷键与盲打推进
+     * 11. 全局快捷键、按住 Ctrl/Option+左键直接点题 与盲打推进
      ********************************************************************/
     window.addEventListener('mousemove', (e) => {
         STATE.rawMouse.x = e.clientX;
         STATE.rawMouse.y = e.clientY;
+        STATE.lastMouseMoveAt = Date.now();
 
         if (STATE.pickerMode) {
             updatePickerHighlightAt(e.clientX, e.clientY);
@@ -914,62 +997,61 @@
         if (isShortcutMod && e.code === 'KeyQ') {
             e.preventDefault();
             e.stopPropagation();
-            analyzeCurrentPageQuestion();
+            dispatchSmartCommand('ANALYZE');
             return;
         }
         if (isShortcutMod && e.code === 'KeyC') {
             e.preventDefault();
             e.stopPropagation();
-            captureReadingPassageToMemory();
+            dispatchSmartCommand('SAVE_PASSAGE');
             return;
         }
         if (isShortcutMod && e.code === 'KeyX') {
             e.preventDefault();
             e.stopPropagation();
-            clearSavedReadingPassage();
+            dispatchSmartCommand('CLEAR_PASSAGE');
             return;
         }
         if (isShortcutMod && e.code === 'KeyL') {
             e.preventDefault();
             e.stopPropagation();
-            toggleListeningSpeechRecognition();
+            dispatchSmartCommand('TOGGLE_ASR');
             return;
         }
         if (isShortcutMod && e.code === 'KeyS') {
             e.preventDefault();
             e.stopPropagation();
-            toggleScopePickerMode();
+            dispatchSmartCommand('TOGGLE_PICKER');
             return;
         }
         if (isShortcutMod && e.code === 'KeyA') {
             e.preventDefault();
             e.stopPropagation();
-            toggleAutoHumanTyping();
+            dispatchSmartCommand('TOGGLE_AUTOTYPE');
             return;
         }
         if (isShortcutMod && e.code === 'KeyW') {
             e.preventDefault();
             e.stopPropagation();
-            fillTargetInputInstantly();
+            dispatchSmartCommand('FILL_INSTANT');
             return;
         }
         if (isShortcutMod && e.code === 'KeyE') {
             e.preventDefault();
             e.stopPropagation();
-            cycleAlternativeAnswerFormat();
+            dispatchSmartCommand('CYCLE_ALT');
             return;
         }
         if (isShortcutMod && e.code === 'KeyM') {
             e.preventDefault();
             e.stopPropagation();
-            toggleModelMode();
+            dispatchSmartCommand('TOGGLE_MODEL');
             return;
         }
         if (isShortcutMod && e.code === 'KeyH') {
             e.preventDefault();
             e.stopPropagation();
-            CONFIG.showVisualHint = !CONFIG.showVisualHint;
-            toggleVisualUI(CONFIG.showVisualHint);
+            dispatchSmartCommand('TOGGLE_UI');
             return;
         }
 
@@ -1015,11 +1097,16 @@
                 }
             }
         }
-
     }, { capture: true });
 
-    // 普通点击不重定向；选题模式保留原来的锁定行为。
+    // 点击事件：
+    // 1. 若处于瞄准器模式，点击即锁定题块；
+    // 2. 新增 Mac/Win 极速选法：按住 Option/Alt (或 Mac 下按住 Control) + 鼠标左键点一下题目，直接锁定该题并解析！
     window.addEventListener('click', (e) => {
+        STATE.rawMouse.x = e.clientX;
+        STATE.rawMouse.y = e.clientY;
+        STATE.lastMouseMoveAt = Date.now();
+
         if (STATE.pickerMode) {
             e.stopPropagation();
             e.preventDefault();
@@ -1028,6 +1115,16 @@
             if (chosenScope) analyzeCurrentPageQuestion(chosenScope);
             return;
         }
+
+        // 按住 Option/Alt (或 Mac 下 Ctrl+左键，注意排除 Mac 下 Ctrl+左键触发右键菜单的默认行为) 直接点题秒解
+        if (e.altKey) {
+            e.stopPropagation();
+            e.preventDefault();
+            const smartScope = findSmartScopeFromMousePoint(e.clientX, e.clientY);
+            analyzeCurrentPageQuestion(smartScope);
+            return;
+        }
+
         const curItem = getCurrentTargetItem();
         if (curItem && curItem.el && STATE.questionType === 'choice' &&
             (curItem.el.contains(e.target) || (e.target instanceof Element && e.target.contains(curItem.el)))) {
@@ -1036,7 +1133,7 @@
     }, true);
 
     /********************************************************************
-     * 11. DOM 提取器与 DeepSeek 选词填空/单空精准锁定引擎
+     * 12. DOM 提取器与 U校园 / 学习通全能解析引擎
      ********************************************************************/
     function querySelectorAllDeep(selector, root = document) {
         const results = Array.from(root.querySelectorAll(selector));
@@ -1046,20 +1143,22 @@
                 results.push(...querySelectorAllDeep(selector, node.shadowRoot));
             }
         }
+        const iframes = root.querySelectorAll('iframe');
+        for (const ifr of iframes) {
+            try {
+                if (ifr.contentDocument) {
+                    results.push(...querySelectorAllDeep(selector, ifr.contentDocument));
+                }
+            } catch (_) {}
+        }
         return results;
     }
 
     function extractInputsInsideScope(scopeRoot, allowGlobalFallback = true) {
-        const inputSelectors = [
-            'textarea',
-            '[contenteditable="true"]',
-            '[role="textbox"]',
-            '.ql-editor', '.w-e-text', '.ProseMirror', '.edui-body-container',
-            'input[type="text"]', 'input:not([type])', 'input[type="search"]', 'input[type="number"]', 'input[type="tel"]'
-        ];
-        let rawInputs = querySelectorAllDeep(inputSelectors.join(','), scopeRoot);
+        const allBlankSelectors = [...COMMON_INPUT_SELECTORS, ...UNIPUS_PSEUDO_BLANK_SELECTORS].join(',');
+        let rawInputs = querySelectorAllDeep(allBlankSelectors, scopeRoot);
         if (rawInputs.length === 0 && allowGlobalFallback && scopeRoot !== document.body) {
-            rawInputs = querySelectorAllDeep(inputSelectors.join(','), document);
+            rawInputs = querySelectorAllDeep(allBlankSelectors, document);
         }
 
         const validInputs = [];
@@ -1068,36 +1167,38 @@
             if (seenInputEls.has(el) || el.disabled || el.readOnly) continue;
             if (el.type === 'hidden' || el.type === 'radio' || el.type === 'checkbox') continue;
             const rect = el.getBoundingClientRect();
-            if (rect.width < 18 || rect.height < 12) continue;
+            if (rect.width < 16 || rect.height < 12) continue;
             if (rect.bottom < 0 || rect.top > window.innerHeight) continue;
+
+            // 防止父子伪空格重复计入
+            const isParentOfAnother = rawInputs.some(other => other !== el && el.contains(other));
+            if (isParentOfAnother) continue;
+
             seenInputEls.add(el);
 
+            const isRealInput = isEditableElement(el);
             const isLargeBox = el.tagName === 'TEXTAREA' || el.isContentEditable || rect.height >= 55 || rect.width >= 320;
             const placeholder = el.getAttribute('placeholder') || el.getAttribute('aria-label') || '';
-            const currentValue = (el.isContentEditable ? el.innerText : el.value || '').trim();
-            validInputs.push({ el, placeholder, isLargeBox, currentValue });
+            const currentValue = (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA'
+                ? el.value
+                : el.innerText || '').trim();
+            validInputs.push({ el, placeholder, isLargeBox, currentValue, isRealInput });
             if (validInputs.length >= 15) break;
         }
         return validInputs;
     }
 
     function extractOptionsInsideScope(scopeRoot, allowHeuristic = true) {
-        const optionSelectors = [
-            '.option', '.options li', '.question-option', '.answer-item',
-            '.el-radio', '.el-checkbox', '.ant-radio-wrapper', '.ant-checkbox-wrapper',
-            'label', 'li[role="option"]', 'div[role="radio"]', 'div[role="checkbox"]',
-            '[class*="option-item"]', '[class*="optionItem"]', '[class*="choice-item"]'
-        ];
+        let rawCandidates = querySelectorAllDeep(COMMON_OPTION_SELECTORS.join(','), scopeRoot);
 
-        let rawCandidates = querySelectorAllDeep(optionSelectors.join(','), scopeRoot);
-
+        // 启发式兜底 1：扫描带 A./B./C./D. 或 (A) 或 A 开头且同级并列的选项节点（兼容 U校园 图标+文字 flex 布局）
         if (rawCandidates.length === 0 && allowHeuristic) {
-            const optionPrefixRegex = /^\s*([A-H][.、．:：\s)]|[（(][A-H][)）]|[①②③④⑤⑥])/i;
-            const allBlocks = querySelectorAllDeep('li, div, p, span', scopeRoot);
+            const optionPrefixRegex = /^\s*([A-H]([.、．:：\s)]|$)|[（(][A-H][)）]|[①②③④⑤⑥])/i;
+            const allBlocks = querySelectorAllDeep('li, div, p, span, label', scopeRoot);
             for (const node of allBlocks) {
-                if (node.children.length > 6) continue;
+                if (node.children.length > 8) continue;
                 const txt = extractRichTextWithBlanks(node);
-                if (txt.length >= 1 && txt.length <= 240 && optionPrefixRegex.test(txt)) {
+                if (txt.length >= 1 && txt.length <= 260 && optionPrefixRegex.test(txt)) {
                     rawCandidates.push(node);
                 }
             }
@@ -1149,18 +1250,14 @@
         const allScopeInputs = extractInputsInsideScope(scopeRoot, true);
         const validOptions = extractOptionsInsideScope(scopeRoot, true);
 
-        // 核心修复：如果当前区域有多个填空框（例如 U校园 1~6 题），精准找出离鼠标指针最近（或已聚焦）的那一个目标输入框！
         const primaryInputObj = findNearestInputToMouse(allScopeInputs);
         const primaryInputEl = primaryInputObj ? primaryInputObj.el : null;
-
-        // 如果成功锁定了鼠标指向的目标输入框，则将 validInputs 精确收敛为该目标输入框（避免再把答案错绑到第6题上！）
         const targetInputs = primaryInputObj ? [primaryInputObj] : allScopeInputs;
 
         const sectionHeader = extractSectionHeaderAndDirections(scopeRoot);
         const samePagePassage = findSamePageReadingPassage(scopeRoot);
         const listeningClues = extractHiddenListeningClues();
 
-        // 提取带有 [[👉当前需要作答的目标空格👈]] 显式标记的题目文本与同组上下文（含已填单词与上方词库框）
         const markedScopeText = extractRichTextWithBlanks(scopeRoot, primaryInputEl).slice(0, 1800);
         const fullScrollContext = extractScrollContainerFullContext(scopeRoot, primaryInputEl);
 
@@ -1217,12 +1314,13 @@
             inputs
         } = extractQuizFromDOM(explicitScopeEl);
 
-        if (options.length === 0 && inputs.length === 0) {
-            updateStatusBadge(`⚠️ 未在鼠标指向处检测到选项或输入框，可按 <b>${MOD_KEY_LABEL}+S</b> 手动框定题块`);
+        // 兜底机制：即使页面上的题目是纯文本/自定义组件（既没检测到标准选项也没检测到 input），
+        // 只要用户用鼠标框选了文字或者当前题块有超过 10 个字符的文本，依然发送给 DeepSeek 解析并在右下角直接显示答案！
+        if (options.length === 0 && inputs.length === 0 && (!questionText || questionText.length < 6)) {
+            updateStatusBadge(`⚠️ 未在鼠标指向处检测到题目，请将鼠标停在题目文字上或框选题干再按 <b>${MOD_KEY_LABEL}+Q</b>`);
             return;
         }
 
-        // 一旦触发分析且锁定了鼠标指向的空格，立即先把绿框移到该空格上给用户视觉反馈！
         if (inputs.length > 0 && options.length === 0) {
             clearTargetHighlights();
             if (CONFIG.showVisualHint) {
@@ -1232,19 +1330,20 @@
 
         STATE.isAnalyzing = true;
         const stemPreview = escapeHtml(questionText.replace(/\[\[.*?\]\]/g, '___').slice(0, 22));
-        updateStatusBadge(`⏳ 已锁定目标空格「<b>${stemPreview}...</b>」，正在请求 ${STATE.model === 'deepseek-reasoner' ? 'R1' : 'V3'}...`);
+        updateStatusBadge(`⏳ 已锁定「<b>${stemPreview}...</b>」，正在请求 ${STATE.model === 'deepseek-reasoner' ? 'R1' : 'V3'}...`);
 
         const numberedOptions = options.length > 0
             ? options.map((opt, idx) => `[${idx}] ${opt.text}`).join('\n')
             : '（无选择题选项）';
         const numberedInputs = inputs.length > 0
-            ? inputs.map((inp, idx) => `[目标输入框 ${idx}] 类型=${inp.isLargeBox ? '多行文本框' : '单行填空框'} placeholder="${inp.placeholder}" 当前框内值="${inp.currentValue}"`).join('\n')
-            : '（无输入框）';
+            ? inputs.map((inp, idx) => `[目标空格 ${idx}] 类型=${inp.isLargeBox ? '多行文本框' : '填空/选词格'} placeholder="${inp.placeholder}" 当前值="${inp.currentValue}"`).join('\n')
+            : '（无标准输入框，请直接根据题干给出答案）';
 
+        STATE.savedPassage = GM_getValue('DEEPSEEK_SAVED_PASSAGE', '');
         const combinedPassage = [
             STATE.savedPassage ? `【跨页记忆阅读/词库材料】：\n${STATE.savedPassage}` : '',
             fullScrollContext && fullScrollContext.length > questionText.length + 30
-                ? `【同页完整题组与上方词库上下文（注意区分“已填”与“👉当前需要作答的目标空格👈” Complete the sentences）】：\n${fullScrollContext}`
+                ? `【同页完整题组与上方词库上下文（注意区分“已填”与“👉当前需要作答的目标空格👈”）】：\n${fullScrollContext}`
                 : '',
             samePagePassage && !fullScrollContext.includes(samePagePassage.slice(0, 50))
                 ? `【同页关联阅读/词库材料】：\n${samePagePassage}`
@@ -1253,27 +1352,27 @@
         ].filter(Boolean).join('\n\n');
 
         const systemPrompt = [
-            '你是一个专为大学英语四六级(CET-4/6)、U校园(Unipus)、考研英语及各类网课设计的全能题库解析引擎。',
+            '你是一个专为 U校园AI版(uai.unipus.cn / ucontent.unipus.cn)、学习通及大学英语四六级设计的全能题库解析引擎。',
             '请重点遵守以下四大核心判别规则：',
-            '1.【单空/选词填空精准定位】：题目文本中标记为 `[[👉当前需要作答的目标空格_X👈]]` 的位置，就是用户当前鼠标指向并要求你解答的唯一空格！其它标记为 `[[空格_Y(已填:"...")]]` 的是页面上其它题已经填好的单词（可用来辅助判断首字母规律或排除词库中已用过的词）。请务必只针对 `[[👉当前需要作答的目标空格👈]]` 所在的这一句话给出最准确的填入单词，绝不要把其它句子的答案（如第6题的 activities）张冠李戴！',
-            '2.【翻译题精准识别】：若大题标题含“翻译/译成英语/Translation”或 placeholder 含“输入你的英文译文/译文/English”，必须将 questionType 设为 "translate"，且 answers[0] 只输出纯英文译文。',
-            '3.【长阅读/跨页阅读与词库】：若提供了【跨页记忆阅读/词库材料】或【同页完整题组与上方词库上下文】，必须结合词库(words in the box)及语法词性变形(Change the form where necessary)给出准确变形后的单词。',
-            '4.【听力题专项处理】：若提供了实时语音转写，依据转写选答案；若仅有 A/B/C/D 选项而无题干，运用四六级听力同义替换与选项逻辑反推法选出最优项。',
+            '1.【U校园选词填空/单空精准定位】：若标记有 `[[👉当前需要作答的目标空格_X👈]]`，请只针对该空所在句子给出最准确的单词或选项字母，并参考标记为 `[[空格_Y(已填:"...")]]` 的已用词做排除法，绝不要张冠李戴。',
+            '2.【单选/多选/判断题】：依据题干精准选出正确项编号数组 bestIndices。',
+            '3.【翻译题精准识别】：若大题标题含“翻译/译成英语/Translation”或 placeholder 含“输入你的英文译文”，questionType 设为 "translate"，answers[0] 只输出纯英文译文。',
+            '4.【长阅读与听力题】：若提供了背景材料或语音转写，严格依据原文细节推导；无原文听力题按四六级听力同义替换与命题规律反推。',
             '必须严格返回如下 JSON 格式（不要输出任何多余解释或代码块标记）：',
             '{',
             '  "questionType": "choice" 或 "input" 或 "translate" 或 "essay",',
-            '  "bestIndices": [0],',
-            '  "answers": ["针对👉当前需要作答的目标空格👈的唯一准确答案（如 apart）"],',
-            '  "altFormats": ["首选最佳答案(如 apart)", "备选同义/变形词2(如 separated)", "备选词3(如 away)"]',
+            '  "bestIndices": [数字编号数组，如 [0] 或 [0, 2]],',
+            '  "answers": ["针对当前目标题/空格的唯一准确答案"],',
+            '  "altFormats": ["首选最佳答案", "备选答案2", "备选答案3"]',
             '}'
         ].join('\n');
 
         const userPrompt = [
             sectionHeader ? `【所属大题标题与答题要求】：\n${sectionHeader}` : '',
             combinedPassage,
-            `【当前锁定题目内容（请重点看 👉当前需要作答的目标空格👈 所在句子）】：\n${questionText}`,
+            `【当前锁定题目内容】：\n${questionText}`,
             `【候选选项列表】：\n${numberedOptions}`,
-            `【当前锁定的目标输入框】：\n${numberedInputs}`
+            `【当前锁定的目标空格】：\n${numberedInputs}`
         ].filter(Boolean).join('\n\n');
 
         const payload = {
@@ -1309,13 +1408,13 @@
 
                     bindParsedTargets(parsed, options, inputs);
                 } catch (err) {
-                    console.error('[DeepSeek Magnet Pro] 解析响应出错:', err);
+                    console.error('[DeepSeek Pro 3.5] 解析响应出错:', err);
                     updateStatusBadge(`❌ 解析返回数据失败，可按 ${MOD_KEY_LABEL}+Q 重试`);
                 }
             },
             onerror: (err) => {
                 STATE.isAnalyzing = false;
-                console.error('[DeepSeek Magnet Pro] 网络错误:', err);
+                console.error('[DeepSeek Pro 3.5] 网络错误:', err);
                 updateStatusBadge('❌ 网络请求失败，请检查网络连接');
             }
         });
@@ -1385,8 +1484,12 @@
             }
         }
 
+        // 即使页面使用了特殊的非标伪元素，只要模型算出了答案，也在右下角清晰展示出来！
         if (queue.length === 0) {
-            updateStatusBadge(`💡 解析答案：<b>${escapeHtml(answers.join(' / ') || '未知')}</b> (未匹配到页面元素)`);
+            updateStatusBadge(
+                `💡 解析答案：<b>${escapeHtml(answers.join(' / ') || '未知')}</b><br>` +
+                `<span style="color:#94a3b8">直接参考此答案作答 | 按 <b>${MOD_KEY_LABEL}+Q</b> 继续分析下一题</span>`
+            );
             return;
         }
 
@@ -1409,26 +1512,26 @@
 
         if (STATE.questionType === 'translate') {
             updateStatusBadge(
-                `🌐 ${stepTag}英文译文已就绪：<b>${escapeHtml(cur.text.slice(0, 34))}...</b><br>` +
+                `🌐 ${stepTag}英文译文已就绪：<b>${escapeHtml(cur.text.slice(0, 38))}...</b><br>` +
                 `<span style="color:#94a3b8">聚焦敲任意键盲打 | <b>${MOD_KEY_LABEL}+A</b> 自动打字 | <b>${MOD_KEY_LABEL}+E</b> 换译文 | <b>Tab</b> 秒填</span>`
             );
         } else if (STATE.questionType === 'essay') {
             updateStatusBadge(
-                `📝 ${stepTag}简答已就绪 (${cur.text.length}字)：<b>${escapeHtml(cur.text.slice(0, 22))}...</b><br>` +
+                `📝 ${stepTag}简答已就绪 (${cur.text.length}字)：<b>${escapeHtml(cur.text.slice(0, 26))}...</b><br>` +
                 `<span style="color:#94a3b8">聚焦敲任意键按词盲打 | <b>${MOD_KEY_LABEL}+A</b> 自动打字 | <b>${MOD_KEY_LABEL}+E</b> 换版本 | <b>Tab</b> 秒填</span>`
             );
         } else if (STATE.questionType === 'input') {
             const altCount = cur.altFormats?.length || 1;
             const altHint = altCount > 1 ? ` | <b>${MOD_KEY_LABEL}+E</b> 备选词(${altCount})` : '';
             updateStatusBadge(
-                `⌨️ ${stepTag}填空答案：<b>${escapeHtml(cur.text.slice(0, 26))}</b><br>` +
+                `⌨️ ${stepTag}填空答案：<b>${escapeHtml(cur.text.slice(0, 30))}</b><br>` +
                 `<span style="color:#94a3b8">点击该空敲任意键输入 | <b>Tab</b> 秒填${altHint} | <b>Esc</b> 解锁</span>`
             );
         } else {
-            const multiHint = total > 1 ? ' (多选：点击当前提示选项后显示下一项)' : '';
+            const multiHint = total > 1 ? ' (多选：点击当前项后提示下一项)' : '';
             updateStatusBadge(
-                `✅ ${stepTag}锁定选项：<b>${escapeHtml(cur.text.slice(0, 24))}</b>${multiHint}<br>` +
-                `<span style="color:#94a3b8">请点击高亮提示的选项</span>`
+                `✅ ${stepTag}锁定选项：<b>${escapeHtml(cur.text.slice(0, 28))}</b>${multiHint}<br>` +
+                `<span style="color:#94a3b8">请查看页面绿色高亮提示选项</span>`
             );
         }
     }
