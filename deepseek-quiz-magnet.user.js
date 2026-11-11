@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         DeepSeek 智能题库解析与磁吸自瞄助手 Pro (3.1 U校园/选词填空精准定位版)
 // @namespace    https://tampermonkey.net/
-// @version      3.5.0
+// @version      3.5.1
 // @updateURL    https://raw.githubusercontent.com/lihua0100-arch/deepseek-quiz-magnet/main/deepseek-quiz-magnet.user.js
 // @downloadURL  https://raw.githubusercontent.com/lihua0100-arch/deepseek-quiz-magnet/main/deepseek-quiz-magnet.user.js
-// @description  U校园与学习通题目解析助手，支持鼠标指题、选题和快捷键；嵌入页面请在题目所在区域操作。
+// @description  U校园与学习通题目解析助手，支持鼠标指题、选题和快捷键；支持跨框架自动转发与顶层状态栏。
 // @author       Gemini
 // @match        *://*/*
 // @allFrames    true
@@ -52,7 +52,7 @@
         autoTypingTimer: null,
         isAnalyzing: false,
         rawMouse: { x: window.innerWidth / 2, y: window.innerHeight / 2 },
-        lastMouseMoveAt: Date.now(), // 记录鼠标最后一次在当前 frame 活动的时间戳
+        lastMouseMoveAt: 0, // 记录鼠标最后一次在当前 frame 活动的时间戳
 
         questionType: 'choice',      // 'choice' | 'input' | 'translate' | 'essay'
         targetQueue: [],             // [{ el, text, altFormats: [], completed: false }]
@@ -61,7 +61,72 @@
         typingCursorIndex: 0
     };
 
-    // 命令在题目所在框架中执行。
+    // 跨框架命令只接受父框架/顶层；状态只接受当前页的子框架。
+    function trustedFrameOrigin(origin) {
+        if (origin === location.origin) return true;
+        try {
+            const host = new URL(origin).hostname;
+            const family = h => ['unipus.cn', 'chaoxing.com', 'edu.cn'].find(d => h === d || h.endsWith('.' + d));
+            const localFamily = family(location.hostname);
+            return localFamily && localFamily !== 'edu.cn' && family(host) === localFamily;
+        } catch (_) { return false; }
+    }
+    function isDescendantFrame(source, root = window, depth = 0) {
+        if (depth > 6) return false;
+        try {
+            for (let i = 0; i < root.frames.length; i++) {
+                const child = root.frames[i];
+                if (child === source || isDescendantFrame(source, child, depth + 1)) return true;
+            }
+        } catch (_) {}
+        return false;
+    }
+    function hasQuizElementsInCurrentDocument() {
+        const selector = [...COMMON_OPTION_SELECTORS, ...COMMON_INPUT_SELECTORS, ...UNIPUS_PSEUDO_BLANK_SELECTORS].join(',');
+        return Array.from(document.querySelectorAll(selector)).some(el => {
+            const r = el.getBoundingClientRect();
+            return r.width >= 16 && r.height >= 12 && r.bottom > 0 && r.top < innerHeight;
+        });
+    }
+    function broadcastToAllFrames(payload) {
+        const msg = Object.assign({ __ds_source: 'DEEPSEEK_QUIZ_HELPER' }, payload);
+        document.querySelectorAll('iframe').forEach(frame => {
+            const r = frame.getBoundingClientRect();
+            if (r.width < 120 || r.height < 80 || r.bottom <= 0 || r.top >= innerHeight) return;
+            try { frame.contentWindow?.postMessage(msg, '*'); } catch (_) {}
+        });
+    }
+    window.addEventListener('message', e => {
+        const data = e.data;
+        if (!data || data.__ds_source !== 'DEEPSEEK_QUIZ_HELPER' || !trustedFrameOrigin(e.origin)) return;
+        if (IS_TOP && data.type === 'UPDATE_BADGE' && isDescendantFrame(e.source)) {
+            STATE.savedPassage = GM_getValue('DEEPSEEK_SAVED_PASSAGE', '');
+            STATE.model = GM_getValue('DEEPSEEK_MODEL', STATE.model);
+            renderBadgeDOM(safeBadgeHTML(data.html), !!data.isASR);
+        }
+        if (!IS_TOP && data.type === 'REMOTE_CMD' && (e.source === window.parent || e.source === window.top)) {
+            if (hasQuizElementsInCurrentDocument()) executeCommandLocally(data.cmd);
+            else broadcastToAllFrames(data);
+        }
+    });
+    function safeBadgeHTML(html) {
+        const template = document.createElement('template');
+        template.innerHTML = String(html || '').slice(0, 12000);
+        const clean = document.createElement('div');
+        function append(nodes, parent) {
+            for (const node of nodes) {
+                if (node.nodeType === 3) { parent.appendChild(document.createTextNode(node.textContent)); continue; }
+                if (node.nodeType !== 1) continue;
+                if (['B', 'I', 'BR', 'SPAN'].includes(node.tagName)) {
+                    const el = document.createElement(node.tagName);
+                    parent.appendChild(el); append(node.childNodes, el);
+                } else if (!['SCRIPT', 'STYLE', 'IFRAME', 'OBJECT'].includes(node.tagName)) append(node.childNodes, parent);
+            }
+        }
+        append(template.content.childNodes, clean);
+        return clean.innerHTML;
+    }
+
     function executeCommandLocally(cmd) {
         if (cmd === 'ANALYZE') analyzeCurrentPageQuestion();
         else if (cmd === 'SAVE_PASSAGE') captureReadingPassageToMemory();
@@ -79,6 +144,10 @@
     }
 
     function dispatchSmartCommand(cmd) {
+        if (cmd === 'ANALYZE' && document.querySelector('iframe') && !hasQuizElementsInCurrentDocument()) {
+            broadcastToAllFrames({ type: 'REMOTE_CMD', cmd });
+            return;
+        }
         executeCommandLocally(cmd);
     }
 
@@ -196,12 +265,12 @@
     window.addEventListener('copy', (e) => e.stopPropagation(), true);
 
     let badgeEl = null;
-    {
+    if (IS_TOP) {
         badgeEl = document.createElement('div');
         badgeEl.id = 'ds-status-badge';
         badgeEl.innerHTML = `
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;gap:6px;">
-                <span style="font-weight:600;color:#38bdf8;">🎯 DeepSeek 题库助手 Pro 3.5</span>
+                <span style="font-weight:600;color:#38bdf8;">🎯 DeepSeek 题库助手 Pro 3.5.1</span>
                 <div style="display:flex;gap:4px;">
                     <span id="ds-mem-tag" style="font-size:10px;background:#065f46;padding:1px 5px;border-radius:4px;color:#a7f3d0;display:${STATE.savedPassage ? 'inline-block' : 'none'};">📚已存阅读(${STATE.savedPassage.length}字)</span>
                     <span id="ds-asr-tag" style="font-size:10px;background:#991b1b;padding:1px 5px;border-radius:4px;color:#fecaca;display:none;">🎙️听力收音中</span>
@@ -231,7 +300,10 @@
     }
 
     function updateStatusBadge(msg) {
-        renderBadgeDOM(msg, STATE.isListeningASR);
+        if (IS_TOP) renderBadgeDOM(msg, STATE.isListeningASR);
+        else {
+            try { window.top.postMessage({ __ds_source: 'DEEPSEEK_QUIZ_HELPER', type: 'UPDATE_BADGE', html: msg, isASR: STATE.isListeningASR }, '*'); } catch (_) {}
+        }
     }
 
     /********************************************************************
@@ -309,6 +381,7 @@
         }
 
         if (!text || text.length < 10) {
+            if (document.querySelector('iframe')) { broadcastToAllFrames({ type: 'REMOTE_CMD', cmd: 'SAVE_PASSAGE' }); return; }
             updateStatusBadge('⚠️ 未能抓取到有效文章或词库，请先用鼠标选中文字再按快捷键');
             return;
         }
@@ -1317,6 +1390,7 @@
         // 兜底机制：即使页面上的题目是纯文本/自定义组件（既没检测到标准选项也没检测到 input），
         // 只要用户用鼠标框选了文字或者当前题块有超过 10 个字符的文本，依然发送给 DeepSeek 解析并在右下角直接显示答案！
         if (options.length === 0 && inputs.length === 0 && (!questionText || questionText.length < 6)) {
+            if (document.querySelector('iframe')) { broadcastToAllFrames({ type: 'REMOTE_CMD', cmd: 'ANALYZE' }); return; }
             updateStatusBadge(`⚠️ 未在鼠标指向处检测到题目，请将鼠标停在题目文字上或框选题干再按 <b>${MOD_KEY_LABEL}+Q</b>`);
             return;
         }
