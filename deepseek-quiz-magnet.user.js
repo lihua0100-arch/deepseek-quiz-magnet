@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DeepSeek 智能题库解析与磁吸自瞄助手 Pro (3.1 U校园/选词填空精准定位版)
 // @namespace    https://tampermonkey.net/
-// @version      3.5.1
+// @version      3.5.2
 // @updateURL    https://raw.githubusercontent.com/lihua0100-arch/deepseek-quiz-magnet/main/deepseek-quiz-magnet.user.js
 // @downloadURL  https://raw.githubusercontent.com/lihua0100-arch/deepseek-quiz-magnet/main/deepseek-quiz-magnet.user.js
 // @description  U校园与学习通题目解析助手，支持鼠标指题、选题和快捷键；支持跨框架自动转发与顶层状态栏。
@@ -34,6 +34,7 @@
     const CONFIG = {
         apiUrl: 'https://api.deepseek.com/chat/completions',
         showVisualHint: true,
+        panelVisible: false,
         enableStealthTyping: true
     };
 
@@ -99,6 +100,9 @@
     window.addEventListener('message', e => {
         const data = e.data;
         if (!data || data.__ds_source !== 'DEEPSEEK_QUIZ_HELPER' || !trustedFrameOrigin(e.origin)) return;
+        if (IS_TOP && data.type === 'TOGGLE_PANEL' && isDescendantFrame(e.source)) {
+            toggleVisualUI(!CONFIG.panelVisible);
+        }
         if (IS_TOP && data.type === 'UPDATE_BADGE' && isDescendantFrame(e.source)) {
             STATE.savedPassage = GM_getValue('DEEPSEEK_SAVED_PASSAGE', '');
             STATE.model = GM_getValue('DEEPSEEK_MODEL', STATE.model);
@@ -138,8 +142,10 @@
         else if (cmd === 'CYCLE_ALT') cycleAlternativeAnswerFormat();
         else if (cmd === 'TOGGLE_MODEL') toggleModelMode();
         else if (cmd === 'TOGGLE_UI') {
-            CONFIG.showVisualHint = !CONFIG.showVisualHint;
-            toggleVisualUI(CONFIG.showVisualHint);
+            if (IS_TOP) toggleVisualUI(!CONFIG.panelVisible);
+            else {
+                try { window.top.postMessage({ __ds_source: 'DEEPSEEK_QUIZ_HELPER', type: 'TOGGLE_PANEL' }, '*'); } catch (_) {}
+            }
         }
     }
 
@@ -270,7 +276,7 @@
         badgeEl.id = 'ds-status-badge';
         badgeEl.innerHTML = `
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;gap:6px;">
-                <span style="font-weight:600;color:#38bdf8;">🎯 DeepSeek 题库助手 Pro 3.5.1</span>
+                <span style="font-weight:600;color:#38bdf8;">🎯 DeepSeek 题库助手 Pro 3.5.2</span>
                 <div style="display:flex;gap:4px;">
                     <span id="ds-mem-tag" style="font-size:10px;background:#065f46;padding:1px 5px;border-radius:4px;color:#a7f3d0;display:${STATE.savedPassage ? 'inline-block' : 'none'};">📚已存阅读(${STATE.savedPassage.length}字)</span>
                     <span id="ds-asr-tag" style="font-size:10px;background:#991b1b;padding:1px 5px;border-radius:4px;color:#fecaca;display:none;">🎙️听力收音中</span>
@@ -279,6 +285,7 @@
             </div>
             <div id="ds-status-text">指题按 <b>${MOD_KEY_LABEL}+Q</b> 或 <b>按住${MOD_KEY_LABEL}+左键点题</b> | 存阅读 <b>${MOD_KEY_LABEL}+C</b></div>
         `;
+        badgeEl.style.display = CONFIG.panelVisible ? 'block' : 'none';
         document.body.appendChild(badgeEl);
     }
 
@@ -651,8 +658,8 @@
     }
 
     function toggleVisualUI(visible) {
+        CONFIG.panelVisible = visible;
         if (badgeEl) badgeEl.style.display = visible ? 'block' : 'none';
-        refreshTargetHighlights();
     }
 
     function getCurrentTargetItem() {
